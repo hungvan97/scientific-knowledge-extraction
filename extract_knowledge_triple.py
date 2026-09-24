@@ -277,11 +277,5 @@ def main():
         if success:
             satisfied_articles += 1
 
-    print("\n=== Extraction Summary ===")
-    print(f"Total articles processed: {total_articles}")
-    print(f"Articles with extracted constructs and measures: {satisfied_articles}")
-    print(f"Articles without relevant content: {total_articles - satisfied_articles}")
-
-
 if __name__ == "__main__":
     main()
