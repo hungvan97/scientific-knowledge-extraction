@@ -4,10 +4,14 @@ from pathlib import Path
 from typing import List
 
 import torch
+
+import json
+import xml.etree.ElementTree as ET
+
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, GenerationConfig
 
 try:
     import instructor
@@ -24,27 +28,44 @@ class PsychTriple(BaseModel):
     justification: str
 
 
-def extract_text_from_tei_xml(tei_path: str) -> str:
+def extract_text_from_tei_xml(tei_path: str) -> list[dict]:
     """Extract readable text from a TEI-XML article file."""
-    try:
-        with open(tei_path, "r", encoding="utf-8") as file:
-            soup = BeautifulSoup(file.read(), "lxml-xml")
+    tree = ET.parse(tei_path)
+    root = tree.getroot()
 
-        text_node = soup.find("text") or soup.find("body")
-        if text_node is None:
-            return ""
+    chunks = []
 
-        text = text_node.get_text(separator="\n")
-        return " ".join(text.split())
-    except Exception as e:
-        print(f"Error parsing {tei_path}: {e}")
-        return ""
+    for div in root.iter():
+        if div.tag.rsplit("}", 1)[-1] != "div":
+            continue
+
+        heading = None
+        paragraphs = []
+
+        for child in div:
+            tag = child.tag.rsplit("}", 1)[-1]
+
+            if tag == "head":
+                heading = " ".join(child.itertext()).strip()
+
+            elif tag == "p":
+                text = " ".join(child.itertext()).strip()
+                if text:
+                    paragraphs.append(text)
+
+        if heading and paragraphs:
+            chunks.append({
+                "chunk_id": len(chunks),
+                "heading": heading,
+                "text": paragraphs
+            })
+    return chunks
 
 def build_prompt(text: str) -> str:
     """Construct a prompt that asks the LLM to return structured triples."""
     return f"""You are an expert in psychology and computational knowledge representation.
 
-Your task is to extract key scientific information from psychology research articles to build a structured knowledge graph.
+Your task is to extract key scientific information from the following input text, which extracted from psychology research articles, to build a structured knowledge graph.
 
 The knowledge graph aims to represent the relationships between psychological topics or constructs and their associated measurement instruments or scales. Specifically, for each article, extract information in the form of triples that capture:
 1) The psychological topic or construct being studied
@@ -56,7 +77,7 @@ Guidelines:
 - Include a short justification for each extraction that clearly supports the connection.
 - If the article does not discuss psychological constructs and how they are measured (for example, no mention of constructs, instruments, or scales), return an empty list `[]`.
 
-Input Paper:
+Input text to be processed:
 \"\"\"{text}\"\"\"
 
 Output: Provide your response as a JSON list in the following format:
@@ -74,61 +95,65 @@ Return only the JSON array. Do not include explanations, analysis, or Markdown.
 
 def process_file(file_path: str, prompt_dir: str, output_dir: str, llm) -> bool:
     """Process one TEI XML file and save the extracted triples to JSON."""
-    text = extract_text_from_tei_xml(file_path)
-    if not text:
+    chunk_text = extract_text_from_tei_xml(file_path)
+    if not chunk_text:
         print(f"⚠️ Skipping empty or malformed text in {file_path}")
         return False
 
-    prompt = build_prompt(text[:40000])
-    prompt_path = Path(prompt_dir) / f"{Path(file_path).stem}.prompt.txt"
-    output_path = Path(output_dir) / f"{Path(file_path).stem}.json"
+    for index, chunk in enumerate(chunk_text):
+        text = chunk['heading'] + ':\n\n' + "\n\n".join(chunk['text'])
+        prompt = build_prompt(text)
+        prompt_path = Path(prompt_dir) / f"{Path(file_path).stem}.{index+1}.prompt.txt"
 
-    with open(prompt_path, "w", encoding="utf-8") as f:
-        f.write(prompt)
+        output_path = Path(output_dir) / f"{Path(file_path).stem}.chunk{index+1}.json"
+        all_triples: list[dict] = []
 
-    try:
+        with open(prompt_path, "w", encoding="utf-8") as f:
+            f.write(prompt)
+
         try:
-            results = llm.create(
-                response_model=List[PsychTriple],
-                messages=[{"role": "user", "content": prompt}],
-            )
-        except TypeError:
             try:
+                print(f"Text to process: {text}")
                 results = llm.create(
                     response_model=List[PsychTriple],
                     messages=[{"role": "user", "content": prompt}],
-                    mode=instructor.Mode.JSON,
                 )
             except TypeError:
-                results = llm.create(
-                    response_model=List[PsychTriple],
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"},
-                )
+                try:
+                    results = llm.create(
+                        response_model=List[PsychTriple],
+                        messages=[{"role": "user", "content": prompt}],
+                        mode=instructor.Mode.JSON,
+                    )
+                except TypeError:
+                    results = llm.create(
+                        response_model=List[PsychTriple],
+                        messages=[{"role": "user", "content": prompt}],
+                        response_format={"type": "json_object"},
+                    )
 
-        if not results:
-            print(f"✅ {file_path} | Extracted 0 triples")
-            return False
-
-        serializable = []
-        for item in results:
-            if hasattr(item, "model_dump"):
-                serializable.append(item.model_dump())
-            elif hasattr(item, "dict"):
-                serializable.append(item.dict())
+            if not results:
+                print(f"❌ Chunk number {index+1} extracts 0 triple")
+                continue
             else:
-                serializable.append(dict(item))
+                print(f"✅ Chunk number {index+1} extracts {len(results)} triples")
+                for triple in results:
+                    if hasattr(triple, "model_dump"):
+                        all_triples.append(triple.model_dump())
+                    elif hasattr(triple, "dict"):
+                        all_triples.append(triple.dict())
+                    else:
+                        all_triples.append(dict(triple))
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(serializable, f, ensure_ascii=False, indent=2)
+        except ValidationError as ve:
+            print(f"❌ Chunk {index+1} failed to validate:\n{ve}")
+        except Exception as e:
+            print(f"❌ Chunk {index+1} failed to process: {e}")
+        
 
-        print(f"✅ {file_path} | Extracted {len(results)} triples")
-        return True
-
-    except ValidationError as ve:
-        print(f"❌ Validation failed for {file_path}:\n{ve}")
-    except Exception as e:
-        print(f"❌ Failed to process {file_path}: {e}")
+        if all_triples:
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(all_triples, f, ensure_ascii=False, indent=2)
 
     return False
 
@@ -149,19 +174,23 @@ def main():
     for d in [input_dir, prompt_dir, output_dir]:
         os.makedirs(d, exist_ok=True)
 
+    # Model configuration
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         low_cpu_mem_usage = True
     )
-
+    generation_config = GenerationConfig(
+        max_new_tokens=2048,
+        max_length=None,
+    )
     text_gen_pipeline = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=512,
         return_full_text=False,
+        clean_up_tokenization_spaces=False,
     )
 
     def hf_create(*, response_model=None, messages=None, **kwargs):
@@ -176,9 +205,21 @@ def main():
         if not prompt:
             raise ValueError("Empty prompt was provided to the Hugging Face pipeline.")
 
+        ## Formatted prompts using Qwen’s chat template before text generation. Added the user role and generation prompt marker
+        chat_messages = [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ]
+        formatted_prompt = tokenizer.apply_chat_template(
+            chat_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
         generated = text_gen_pipeline(
-            [prompt],
-            max_new_tokens=512,
+            [formatted_prompt],
+            generation_config = generation_config,
             return_full_text=False,
         )
 
